@@ -54,7 +54,13 @@
 package context
 
 import (
+	"errors"
 	"time"
+)
+
+var (
+	ErrCanceled = errors.New("context canceled")
+	ErrTimeout  = errors.New("context deadline exceeded")
 )
 
 // A Context carries a deadline, a cancellation signal, and other values across
@@ -106,75 +112,137 @@ type Context interface {
 	// or DeadlineExceeded if the context's deadline passed.
 	// After Err returns a non-nil error, successive calls to Err return the same error.
 	Err() error
-
-	// Value returns the value associated with this context for key, or nil
-	// if no value is associated with key. Successive calls to Value with
-	// the same key returns the same result.
-	//
-	// Use context values only for request-scoped data that transits
-	// processes and API boundaries, not for passing optional parameters to
-	// functions.
-	//
-	// A key identifies a specific value in a Context. Functions that wish
-	// to store values in Context typically allocate a key in a global
-	// variable then use that key as the argument to context.WithValue and
-	// Context.Value. A key can be any type that supports equality;
-	// packages should define keys as an unexported type to avoid
-	// collisions.
-	//
-	// Packages that define a Context key should provide type-safe accessors
-	// for the values stored using that key:
-	//
-	// 	// Package user defines a User type that's stored in Contexts.
-	// 	package user
-	//
-	// 	import "context"
-	//
-	// 	// User is the type of value stored in the Contexts.
-	// 	type User struct {...}
-	//
-	// 	// key is an unexported type for keys defined in this package.
-	// 	// This prevents collisions with keys defined in other packages.
-	// 	type key int
-	//
-	// 	// userKey is the key for user.User values in Contexts. It is
-	// 	// unexported; clients use user.NewContext and user.FromContext
-	// 	// instead of using this key directly.
-	// 	var userKey key
-	//
-	// 	// NewContext returns a new Context that carries value u.
-	// 	func NewContext(ctx context.Context, u *User) context.Context {
-	// 		return context.WithValue(ctx, userKey, u)
-	// 	}
-	//
-	// 	// FromContext returns the User value stored in ctx, if any.
-	// 	func FromContext(ctx context.Context) (*User, bool) {
-	// 		u, ok := ctx.Value(userKey).(*User)
-	// 		return u, ok
-	// 	}
-	Value(key any) any
 }
 
-type stringer interface {
-	String() string
+type emptyCtx struct{}
+
+var _ Context = (*emptyCtx)(nil)
+
+func (emptyCtx) Deadline() (deadline time.Time, ok bool) {
+	return time.Time{}, false
 }
 
-func contextName(c Context) string {
-	if s, ok := c.(stringer); ok {
-		return s.String()
+func (emptyCtx) Done() <-chan struct{} {
+	return nil
+}
+
+func (emptyCtx) Err() error {
+	return nil
+}
+
+type CancelFunc func()
+
+type CancelCtx struct {
+	parent Context
+	done   chan struct{}
+	err    error
+}
+
+var _ Context = (*CancelCtx)(nil)
+
+func (c CancelCtx) Deadline() (deadline time.Time, ok bool) {
+	return c.parent.Deadline()
+}
+
+func (c CancelCtx) Done() <-chan struct{} {
+	select {
+	case <-c.parent.Done():
+		return c.parent.Done()
+	default:
+		return c.done
 	}
-	return "<unknown>"
 }
 
-// stringify tries a bit to stringify v, without using fmt, since we don't
-// want context depending on the unicode tables. This is only used by
-// *valueCtx.String().
-func stringify(v any) string {
-	switch s := v.(type) {
-	case stringer:
-		return s.String()
-	case string:
-		return s
+func (c CancelCtx) Err() error {
+	if c.parent.Err() != nil {
+		return c.parent.Err()
 	}
-	return "<not Stringer>"
+	return c.err
+}
+
+// WithCancel returns a copy of parent with a new Done channel. The returned
+// context's Done channel is closed when the returned cancel function is called
+// or when the parent context's Done channel is closed, whichever happens first.
+func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
+	c := &CancelCtx{
+		parent: parent,
+		done:   make(chan struct{}),
+	}
+	f := func() {
+		_, ok := <-c.done
+		if ok {
+			c.done <- struct{}{}
+			c.err = ErrCanceled
+		}
+	}
+	return c, f
+}
+
+type TimeoutCtx struct {
+	parent  Context
+	timeout time.Time
+	done    chan struct{}
+	err     error
+}
+
+func (c TimeoutCtx) Deadline() (deadline time.Time, ok bool) {
+	return c.timeout, true
+}
+
+func (c TimeoutCtx) Done() <-chan struct{} {
+	select {
+	case <-c.parent.Done():
+		return c.parent.Done()
+	default:
+		return c.done
+	}
+}
+
+func (c TimeoutCtx) Err() error {
+	if c.parent.Err() != nil {
+		return c.parent.Err()
+	}
+	return c.err
+}
+
+// WithDeadline returns a copy of the parent context with the deadline adjusted
+// to be no later than d. If the parent's deadline is already earlier than d,
+// WithDeadline(parent, d) is semantically equivalent to parent. The returned
+// [Context.Done] channel is closed when the deadline expires, when the returned
+// cancel function is called, or when the parent context's Done channel is
+// closed, whichever happens first.
+func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc) {
+	c := TimeoutCtx{
+		parent:  parent,
+		timeout: deadline,
+	}
+	t, ok := parent.Deadline()
+	if ok && t.Before(deadline) {
+		c.timeout = t
+	}
+	f := func() {
+		_, ok := <-c.done
+		if ok {
+			c.done <- struct{}{}
+			c.err = ErrCanceled
+			if c.timeout.Before(time.Now()) {
+				c.err = ErrTimeout
+			}
+		}
+	}
+	return c, f
+}
+
+// WithTimeout returns WithDeadline(parent, time.Now().Add(timeout)).
+//
+// Canceling this context releases resources associated with it, so code should
+// call cancel as soon as the operations running in this [Context] complete:
+//
+//	func slowOperationWithTimeout(ctx context.Context) (Result, error) {
+//		ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+//		defer cancel()  // releases resources if slowOperation completes before timeout elapses
+//		return slowOperation(ctx)
+//	}
+func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc) {
+	return WithDeadline(parent, time.Now().Add(timeout))
 }
