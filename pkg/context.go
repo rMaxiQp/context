@@ -59,8 +59,8 @@ import (
 )
 
 var (
-	ErrCanceled = errors.New("context canceled")
-	ErrTimeout  = errors.New("context deadline exceeded")
+	ErrCanceled       = errors.New("context canceled")
+	ErrDeadlineExceed = errors.New("context deadline exceeded")
 )
 
 // A Context carries a deadline, a cancellation signal, and other values across
@@ -147,6 +147,10 @@ func (c CancelCtx) Deadline() (deadline time.Time, ok bool) {
 func (c CancelCtx) Done() <-chan struct{} {
 	select {
 	case <-c.parent.Done():
+		_, ok := <-c.parent.Done()
+		if ok {
+			close(c.done)
+		}
 		return c.parent.Done()
 	default:
 		return c.done
@@ -169,36 +173,48 @@ func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
 		done:   make(chan struct{}),
 	}
 	f := func() {
-		_, ok := <-c.done
-		if ok {
-			c.done <- struct{}{}
+		select {
+		case <-c.done:
+			_, ok := <-c.done
+			if ok {
+				close(c.done)
+				c.err = ErrCanceled
+			}
+		default:
+			close(c.done)
 			c.err = ErrCanceled
 		}
 	}
 	return c, f
 }
 
-type TimeoutCtx struct {
-	parent  Context
-	timeout time.Time
-	done    chan struct{}
-	err     error
+type DeadlineCtx struct {
+	parent   Context
+	deadline time.Time
+	done     chan struct{}
+	err      error
 }
 
-func (c TimeoutCtx) Deadline() (deadline time.Time, ok bool) {
-	return c.timeout, true
+var _ Context = (*DeadlineCtx)(nil)
+
+func (c DeadlineCtx) Deadline() (deadline time.Time, ok bool) {
+	return c.deadline, true
 }
 
-func (c TimeoutCtx) Done() <-chan struct{} {
+func (c DeadlineCtx) Done() <-chan struct{} {
 	select {
 	case <-c.parent.Done():
+		_, ok := <-c.parent.Done()
+		if ok {
+			close(c.done)
+		}
 		return c.parent.Done()
 	default:
 		return c.done
 	}
 }
 
-func (c TimeoutCtx) Err() error {
+func (c DeadlineCtx) Err() error {
 	if c.parent.Err() != nil {
 		return c.parent.Err()
 	}
@@ -212,22 +228,26 @@ func (c TimeoutCtx) Err() error {
 // cancel function is called, or when the parent context's Done channel is
 // closed, whichever happens first.
 func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc) {
-	c := TimeoutCtx{
-		parent:  parent,
-		timeout: deadline,
+	c := &DeadlineCtx{
+		parent:   parent,
+		deadline: deadline,
+		done:     make(chan struct{}),
 	}
 	t, ok := parent.Deadline()
 	if ok && t.Before(deadline) {
-		c.timeout = t
+		c.deadline = t
 	}
-	f := func() {
+	cancel := time.AfterFunc(time.Until(c.deadline), func() {
 		_, ok := <-c.done
 		if ok {
-			c.done <- struct{}{}
+			close(c.done)
+			c.err = ErrDeadlineExceed
+		}
+	})
+	f := func() {
+		if cancel.Stop() {
+			close(c.done)
 			c.err = ErrCanceled
-			if c.timeout.Before(time.Now()) {
-				c.err = ErrTimeout
-			}
 		}
 	}
 	return c, f
