@@ -100,9 +100,11 @@ func TestParentDeadlineContext(t *testing.T) {
 	}
 	select {
 	case <-child.Done():
-		t.Error("child.Done should be closed")
+		if child.Err() == nil {
+			t.Error("child.Err should not return nil")
+		}
 	case <-parent.Done():
+		t.Errorf("parent.Done should not be closed, got %v", parent.Err())
 	default:
-		t.Error("child.Done should be closed")
 	}
 }
