@@ -136,31 +136,25 @@ type CancelCtx struct {
 	parent Context
 	done   chan struct{}
 	err    error
+	end    chan struct{}
 }
 
 var _ Context = (*CancelCtx)(nil)
 
-func (c CancelCtx) Deadline() (deadline time.Time, ok bool) {
+func (c *CancelCtx) Deadline() (deadline time.Time, ok bool) {
 	return c.parent.Deadline()
 }
 
-func (c CancelCtx) Done() <-chan struct{} {
+func (c *CancelCtx) Done() <-chan struct{} {
 	select {
 	case <-c.parent.Done():
-		_, ok := <-c.parent.Done()
-		if ok {
-			close(c.done)
-		}
 		return c.parent.Done()
 	default:
-		return c.done
 	}
+	return c.end
 }
 
-func (c CancelCtx) Err() error {
-	if c.parent.Err() != nil {
-		return c.parent.Err()
-	}
+func (c *CancelCtx) Err() error {
 	return c.err
 }
 
@@ -171,18 +165,20 @@ func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
 	c := &CancelCtx{
 		parent: parent,
 		done:   make(chan struct{}),
+		end:    make(chan struct{}, 1),
 	}
+	go func() {
+		c.done <- struct{}{}
+	}()
 	f := func() {
 		select {
 		case <-c.done:
-			_, ok := <-c.done
-			if ok {
-				close(c.done)
-				c.err = ErrCanceled
-			}
-		default:
 			close(c.done)
 			c.err = ErrCanceled
+			go func() {
+				c.end <- struct{}{}
+			}()
+		default:
 		}
 	}
 	return c, f
@@ -192,32 +188,26 @@ type DeadlineCtx struct {
 	parent   Context
 	deadline time.Time
 	done     chan struct{}
+	end      chan struct{}
 	err      error
 }
 
 var _ Context = (*DeadlineCtx)(nil)
 
-func (c DeadlineCtx) Deadline() (deadline time.Time, ok bool) {
+func (c *DeadlineCtx) Deadline() (deadline time.Time, ok bool) {
 	return c.deadline, true
 }
 
-func (c DeadlineCtx) Done() <-chan struct{} {
+func (c *DeadlineCtx) Done() <-chan struct{} {
 	select {
 	case <-c.parent.Done():
-		_, ok := <-c.parent.Done()
-		if ok {
-			close(c.done)
-		}
 		return c.parent.Done()
 	default:
-		return c.done
 	}
+	return c.end
 }
 
-func (c DeadlineCtx) Err() error {
-	if c.parent.Err() != nil {
-		return c.parent.Err()
-	}
+func (c *DeadlineCtx) Err() error {
 	return c.err
 }
 
@@ -232,25 +222,37 @@ func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc) {
 		parent:   parent,
 		deadline: deadline,
 		done:     make(chan struct{}),
+		end:      make(chan struct{}, 1),
 	}
 	t, ok := parent.Deadline()
 	if ok && t.Before(deadline) {
 		c.deadline = t
 	}
+	go func() {
+		c.done <- struct{}{}
+	}()
 	cancel := time.AfterFunc(time.Until(c.deadline), func() {
-		_, ok := <-c.done
-		if ok {
-			close(c.done)
-			c.err = ErrDeadlineExceed
-		}
+		c.cancelWithCause(ErrDeadlineExceed)
 	})
 	f := func() {
-		if cancel.Stop() {
-			close(c.done)
-			c.err = ErrCanceled
+		if !cancel.Stop() {
+			return
 		}
+		c.cancelWithCause(ErrCanceled)
 	}
 	return c, f
+}
+
+func (c *DeadlineCtx) cancelWithCause(err error) {
+	select {
+	case <-c.done:
+		close(c.done)
+		c.err = err
+		go func() {
+			c.end <- struct{}{}
+		}()
+	default:
+	}
 }
 
 // WithTimeout returns WithDeadline(parent, time.Now().Add(timeout)).
