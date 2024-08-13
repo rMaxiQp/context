@@ -55,6 +55,7 @@ package context
 
 import (
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -132,71 +133,140 @@ func (emptyCtx) Err() error {
 
 type CancelFunc func()
 
-type CancelCtx struct {
-	parent Context
-	done   chan struct{}
-	err    error
+type cancelCtx struct {
+	parent   Context
+	done     chan struct{}
+	mu       sync.Mutex
+	children map[canceler]struct{}
+	err      error
 }
 
-var _ Context = (*CancelCtx)(nil)
+var _ Context = (*cancelCtx)(nil)
 
-func (c *CancelCtx) Deadline() (deadline time.Time, ok bool) {
+func (c *cancelCtx) Deadline() (deadline time.Time, ok bool) {
 	return c.parent.Deadline()
 }
 
-func (c *CancelCtx) Done() <-chan struct{} {
-	if c.parent.Done() == nil {
-		return c.done
-	}
-	select {
-	case <-c.parent.Done():
-		c.cancelWithCause(c.parent.Err())()
-	default:
-	}
+func (c *cancelCtx) Done() <-chan struct{} {
 	return c.done
 }
 
-func (c *CancelCtx) Err() error {
+func (c *cancelCtx) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.err
 }
 
 // WithCancel returns a copy of parent with a new Done channel. The returned
 // context's Done channel is closed when the returned cancel function is called
 // or when the parent context's Done channel is closed, whichever happens first.
-func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
-	c := &CancelCtx{
+func WithCancel(parent Context) (Context, CancelFunc) {
+	c := &cancelCtx{
 		parent: parent,
-		done:   make(chan struct{}, 1),
+		done:   make(chan struct{}),
 	}
-	c.done <- struct{}{}
-	return c, c.cancelWithCause(ErrCanceled)
+	return c.withCancel(parent), func() { c.cancel(true, ErrCanceled) }
 }
 
-func (c *CancelCtx) cancelWithCause(err error) func() {
-	return func() {
-		select {
-		case <-c.done:
-			close(c.done)
-			c.err = err
-		default:
+func (c *cancelCtx) withCancel(parent Context) *cancelCtx {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
+	c.propagateCancel(parent, c)
+	return c
+}
+
+type canceler interface {
+	cancel(removeFromParent bool, err error)
+	Done() <-chan struct{}
+}
+
+func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+	if err == nil {
+		panic("context: internal error: missing cancellation error")
+	}
+	c.mu.Lock()
+	if c.err != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.err = err
+	close(c.done)
+	for child := range c.children {
+		child.cancel(false, err)
+	}
+	c.children = nil
+	c.mu.Unlock()
+	if removeFromParent {
+		removeChild(c.parent, c)
+	}
+}
+
+func parentCancelCtx(parent Context) (*cancelCtx, bool) {
+	for {
+		switch c := parent.(type) {
+		case *cancelCtx:
+			return c, true
+		case *timerCtx:
+			return nil, false
+		case *emptyCtx:
+			return nil, false
 		}
 	}
 }
 
-type DeadlineCtx struct {
-	parent   Context
-	deadline time.Time
-	done     chan struct{}
-	err      error
+func removeChild(parent Context, child canceler) {
+	p, ok := parentCancelCtx(parent)
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	if p.children != nil {
+		delete(p.children, child)
+	}
+	p.mu.Unlock()
 }
 
-var _ Context = (*DeadlineCtx)(nil)
+func (c *cancelCtx) propagateCancel(parent Context, child canceler) {
+	if parent.Done() == nil {
+		return
+	}
+	if p, ok := parentCancelCtx(parent); ok {
+		p.mu.Lock()
+		if p.err != nil {
+			child.cancel(false, p.err)
+		} else {
+			if p.children == nil {
+				p.children = make(map[canceler]struct{})
+			}
+			p.children[child] = struct{}{}
+		}
+		p.mu.Unlock()
+	} else {
+		go func() {
+			select {
+			case <-parent.Done():
+				child.cancel(true, parent.Err())
+			case <-child.Done():
+			}
+		}()
+	}
+}
 
-func (c DeadlineCtx) Deadline() (deadline time.Time, ok bool) {
+type timerCtx struct {
+	cancelCtx
+
+	timer    *time.Timer
+	deadline time.Time
+}
+
+var _ Context = (*timerCtx)(nil)
+
+func (c *timerCtx) Deadline() (deadline time.Time, ok bool) {
 	return c.deadline, true
 }
 
-func (c DeadlineCtx) Done() <-chan struct{} {
+func (c *timerCtx) Done() <-chan struct{} {
 	select {
 	case <-c.parent.Done():
 		return c.parent.Done()
@@ -205,8 +275,21 @@ func (c DeadlineCtx) Done() <-chan struct{} {
 	return c.done
 }
 
-func (c DeadlineCtx) Err() error {
+func (c *timerCtx) Err() error {
 	return c.err
+}
+
+func (c *timerCtx) cancel(removeFromParent bool, err error) {
+	c.cancelCtx.cancel(false, err)
+	if removeFromParent {
+		removeChild(c.parent, c)
+	}
+	c.mu.Lock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	c.mu.Unlock()
 }
 
 // WithDeadline returns a copy of the parent context with the deadline adjusted
@@ -216,35 +299,30 @@ func (c DeadlineCtx) Err() error {
 // cancel function is called, or when the parent context's Done channel is
 // closed, whichever happens first.
 func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc) {
-	c := &DeadlineCtx{
-		parent:   parent,
+	if curr, ok := parent.Deadline(); ok && curr.Before(deadline) {
+		return WithCancel(parent)
+	}
+	t := &timerCtx{
+		cancelCtx: cancelCtx{
+			parent: parent,
+			done:   make(chan struct{}),
+		},
 		deadline: deadline,
-		done:     make(chan struct{}, 1),
 	}
-	t, ok := parent.Deadline()
-	if ok && t.Before(deadline) {
-		c.deadline = t
+	t.propagateCancel(parent, t)
+	d := time.Until(deadline)
+	if d <= 0 {
+		t.cancel(true, ErrDeadlineExceed)
+		return t, func() { t.cancel(true, ErrCanceled) }
 	}
-	c.done <- struct{}{}
-	cancel := time.AfterFunc(time.Until(c.deadline), c.cancelWithCause(ErrDeadlineExceed))
-	f := func() {
-		if !cancel.Stop() {
-			return
-		}
-		c.cancelWithCause(ErrCanceled)()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.err == nil {
+		t.timer = time.AfterFunc(d, func() {
+			t.cancel(true, ErrDeadlineExceed)
+		})
 	}
-	return c, f
-}
-
-func (c *DeadlineCtx) cancelWithCause(err error) func() {
-	return func() {
-		select {
-		case <-c.done:
-			close(c.done)
-			c.err = err
-		default:
-		}
-	}
+	return t, func() { t.cancel(true, ErrCanceled) }
 }
 
 // WithTimeout returns WithDeadline(parent, time.Now().Add(timeout)).
